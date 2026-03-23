@@ -31,25 +31,37 @@ st.set_page_config(
 
 
 def init_session_state():
-    """初始化session state"""
-    if 'engine' not in st.session_state:
-        try:
-            llm_client = SiliconFlowClient()
-            st.session_state.engine = LLMMissionEngineV2(llm_client)
-        except Exception as e:
-            st.session_state.engine = LLMMissionEngineV2()
+        """初始化session state"""
+        if 'engine' not in st.session_state:
+            try:
+                llm_client = SiliconFlowClient()
+                st.session_state.engine = LLMMissionEngineV2(llm_client)
+            except Exception as e:
+                st.session_state.engine = LLMMissionEngineV2()
 
-    if 'messages' not in st.session_state:
-        st.session_state.messages = []
+        if 'messages' not in st.session_state:
+            st.session_state.messages = []
 
-    if 'calculator' not in st.session_state:
-        st.session_state.calculator = PerOrderCostCalculator()
+        if 'calculator' not in st.session_state:
+            st.session_state.calculator = PerOrderCostCalculator()
 
-    if 'file_processor' not in st.session_state:
-        st.session_state.file_processor = FileProcessor()
+        if 'file_processor' not in st.session_state:
+            st.session_state.file_processor = FileProcessor()
 
-    if 'current_data' not in st.session_state:
-        st.session_state.current_data = {}
+        if 'current_data' not in st.session_state:
+            st.session_state.current_data = {}
+
+        if 'state' not in st.session_state:
+            st.session_state.state = 'idle'
+
+        if 'pending_response' not in st.session_state:
+            st.session_state.pending_response = None
+
+        if 'pending_calculation' not in st.session_state:
+            st.session_state.pending_calculation = False
+
+        if 'calc_data' not in st.session_state:
+            st.session_state.calc_data = None
 
 
 def add_message(role: str, content: str, message_type: str = "text"):
@@ -384,63 +396,68 @@ def main():
             else:
                 st.error(f"处理文件失败: {file_result.get('error', '未知错误')}")
     
-    # 用户输入
+    # 主输入区
     user_input = st.chat_input("请输入您的需求...")
 
+    # 处理输入
     if user_input:
         add_message("user", user_input)
 
-        with st.spinner("🤔 思考中..."):
-            response = st.session_state.engine.process(user_input)
-
-        intent = response.get("intent")
-        needs_calculation = response.get("needs_calculation", False)
-        context = response.get("context", {})
-        data = context.get("collected_data", {})
-
-        if needs_calculation and data.get("items_per_order") and data.get("distance_km"):
-            summary = build_data_summary(data)
-            add_message("assistant", summary + "\n\n请确认以上信息无误后，我将为您计算成本。")
-            st.session_state.pending_calculation = True
-            st.session_state.calc_data = data
-            st.rerun()
-        else:
-            add_message("assistant", response.get("message"))
-
-    if st.session_state.get("pending_calculation"):
-        user_input = st.chat_input("输入「确认」继续计算，或补充其他信息...")
-
-        if user_input:
-            add_message("user", user_input)
-
-            if user_input in ["确认", "是", "好的", "计算", "开始"]:
-                data = st.session_state.calc_data
-                confirmed_context = {"collected_data": data}
-                calc_result = perform_cost_calculation(confirmed_context)
-
-                if calc_result.get("success"):
-                    cost_result = calc_result.get("result")
-                    result_text = format_cost_result(cost_result)
-                    add_message("assistant", result_text, "table")
-
-                    if data.get("purchase_price") and data.get("selling_price"):
-                        profit_result = perform_profit_analysis(confirmed_context, cost_result)
-                        if profit_result:
-                            profit_text = format_profit_result(profit_result)
-                            add_message("assistant", profit_text, "table")
-
-                    add_message("assistant", "💡 如有其他问题，欢迎继续提问！")
-                else:
-                    add_message("error", f"计算失败: {calc_result.get('error')}")
-
-                st.session_state.pending_calculation = False
+        if st.session_state.state == 'awaiting_confirmation':
+            if user_input.lower() in ["确认", "是", "好的", "y", "yes"]:
+                st.session_state.state = 'calculating'
                 st.rerun()
             else:
+                st.session_state.state = 'idle'
                 st.session_state.pending_calculation = False
-                with st.spinner("🤔 思考中..."):
-                    response = st.session_state.engine.process(user_input)
-                add_message("assistant", response.get("message"))
                 st.rerun()
+        elif st.session_state.state == 'calculating':
+            pass
+        else:
+            with st.spinner("🤔 思考中..."):
+                response = st.session_state.engine.process(user_input)
+
+            needs_calc = response.get("needs_calculation", False)
+            data = response.get("context", {}).get("collected_data", {})
+
+            if needs_calc and data.get("items_per_order") and data.get("distance_km"):
+                summary = build_data_summary(data)
+                add_message("assistant", summary)
+                add_message("assistant", "请回复「确认」开始计算，或补充其他信息。")
+                st.session_state.pending_calculation = True
+                st.session_state.calc_data = data
+                st.session_state.state = 'awaiting_confirmation'
+            else:
+                add_message("assistant", response.get("message"))
+                st.session_state.state = 'idle'
+
+    # 计算状态处理
+    if st.session_state.state == 'calculating' and st.session_state.pending_calculation:
+        data = st.session_state.calc_data
+        confirmed_context = {"collected_data": data}
+
+        calc_result = perform_cost_calculation(confirmed_context)
+
+        if calc_result.get("success"):
+            cost_result = calc_result.get("result")
+            result_text = format_cost_result(cost_result)
+            add_message("assistant", result_text)
+
+            if data.get("purchase_price") and data.get("selling_price"):
+                profit_result = perform_profit_analysis(confirmed_context, cost_result)
+                if profit_result:
+                    profit_text = format_profit_result(profit_result)
+                    add_message("assistant", profit_text)
+
+            add_message("assistant", "💡 如有其他问题，欢迎继续提问！")
+        else:
+            add_message("assistant", f"计算失败: {calc_result.get('error')}")
+
+        st.session_state.pending_calculation = False
+        st.session_state.calc_data = None
+        st.session_state.state = 'idle'
+
+    display_messages()
     
     # 侧边栏 - 功能说明
     with st.sidebar:
